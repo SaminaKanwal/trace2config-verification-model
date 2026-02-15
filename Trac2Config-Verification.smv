@@ -1,0 +1,149 @@
+MODULE main
+
+VAR
+  -- Environment inputs (unconstrained unless restricted by INVAR/TRANS)
+  CmdIssued   : boolean;
+  ValidMAC_in : boolean;
+  Fresh_in    : boolean;
+  Replayed_in : boolean;
+
+  -- System state machine
+  state : {IDLE, PROC, ACCEPT, REJECT, ACTUATE};
+
+  -- Latched message attributes (captured when processing starts)
+  msg_validMAC : boolean;
+  msg_fresh    : boolean;
+  msg_replayed : boolean;
+
+  -- Counters (numeric abstraction)
+  proc_k : 0..9;   -- security processing budget (≈ 9.15 ms → 9 steps)
+  e2e_k  : 0..10;  -- end-to-end budget (≈ 10.23 ms → 10 steps)
+
+  -- Outputs
+  Accepted     : boolean;
+  BrakeApplied : boolean;
+
+  -- Deadline violation flag
+  DeadlineMiss : boolean;
+
+ASSIGN
+  -- Initial state
+  init(state)        := IDLE;
+  init(proc_k)       := 0;
+  init(e2e_k)        := 0;
+
+  init(msg_validMAC) := FALSE;
+  init(msg_fresh)    := FALSE;
+  init(msg_replayed) := FALSE;
+
+  init(Accepted)     := FALSE;
+  init(BrakeApplied) := FALSE;
+  init(DeadlineMiss) := FALSE;
+
+  -- Latch message attributes at start
+  next(msg_validMAC) :=
+    case
+      state = IDLE & CmdIssued : ValidMAC_in;
+      TRUE                    : msg_validMAC;
+    esac;
+
+  next(msg_fresh) :=
+    case
+      state = IDLE & CmdIssued : Fresh_in;
+      TRUE                    : msg_fresh;
+    esac;
+
+  next(msg_replayed) :=
+    case
+      state = IDLE & CmdIssued : Replayed_in;
+      TRUE                    : msg_replayed;
+    esac;
+
+  -- Security processing counter
+  next(proc_k) :=
+    case
+      state = IDLE & CmdIssued : 0;
+      state = PROC & proc_k < 9 : proc_k + 1;
+      state != PROC : 0;
+      TRUE          : proc_k;
+    esac;
+
+  -- End-to-end counter
+  next(e2e_k) :=
+    case
+      state = IDLE & CmdIssued : 0;
+      state != IDLE & e2e_k < 10 : e2e_k + 1;
+      state = IDLE : 0;
+      TRUE         : e2e_k;
+    esac;
+
+  -- State machine
+  next(state) :=
+    case
+      state = IDLE & CmdIssued : PROC;
+
+      state = PROC & proc_k < 9 : PROC;
+
+      state = PROC & proc_k = 9 &
+        msg_validMAC & msg_fresh & !msg_replayed : ACCEPT;
+
+      state = PROC & proc_k = 9 : REJECT;
+
+      state = ACCEPT  : ACTUATE;
+      state = ACTUATE : IDLE;
+      state = REJECT  : IDLE;
+
+      TRUE : state;
+    esac;
+
+  -- Outputs (one-step pulses)
+  next(Accepted) :=
+    case
+      state = ACCEPT : TRUE;
+      TRUE           : FALSE;
+    esac;
+
+  next(BrakeApplied) :=
+    case
+      state = ACTUATE : TRUE;
+      TRUE            : FALSE;
+    esac;
+
+  -- Deadline miss: if we reach e2e_k = 10 while still not actuating
+  next(DeadlineMiss) :=
+    case
+      DeadlineMiss : TRUE;  -- sticky flag
+      (state != IDLE) & (e2e_k = 10) & (state != ACTUATE) : TRUE;
+      TRUE : FALSE;
+    esac;
+
+-- ----------------------------
+-- Assumptions (admissibility)
+-- ----------------------------
+
+-- Replay implies freshness failure (stateful freshness abstraction)
+INVAR (Replayed_in -> !Fresh_in)
+
+-- Single-message pipeline: no new CmdIssued while busy
+INVAR (state != IDLE -> !CmdIssued)
+
+-- ----------------------------
+-- Contracts / KPIs
+-- ----------------------------
+
+-- C_AUTH (R1): invalid MACs never lead to acceptance
+LTLSPEC
+  G ( !msg_validMAC -> !Accepted )
+
+-- C_FRESH (R2/T5): replayed messages never actuate brakes
+LTLSPEC
+  G ( msg_replayed -> X(!BrakeApplied) )
+
+-- C_LIVENESS: legitimate commands eventually actuate
+LTLSPEC
+  G ( CmdIssued & ValidMAC_in & Fresh_in & !Replayed_in -> F BrakeApplied )
+
+-- C_LATENCY (numeric KPI): no end-to-end deadline miss within 10 steps
+-- (This is the NuSMV-safe replacement for F[0..10].)
+LTLSPEC
+  G ( CmdIssued -> !DeadlineMiss )
